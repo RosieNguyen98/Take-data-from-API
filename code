@@ -1,0 +1,108 @@
+import requests
+import json
+import os
+import gspread
+from oauth2client.service_account import ServiceAccountCredentials
+from googleapiclient.discovery import build
+import concurrent.futures
+import pandas as pd
+import io
+from datetime import datetime
+import pandas as pd
+from tabulate import tabulate
+
+# Thiết lập thông tin Google Sheets
+json_keyfile_path = .....
+
+scope = ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive' ]
+credentials = ServiceAccountCredentials.from_json_keyfile_name(json_keyfile_path, scope)
+gc = gspread.authorize(credentials)
+drive_service = build('drive', 'v3', credentials=credentials)
+
+# Webhook 
+webhook_url = "https://chat.googleapis.com/v1/spaces/AAAA7An4Ups/messages?key=AIzaSyDdI0hCZtE6vySjMm-WEfRq3CPzqKqqsHI&token=zt_X_4Q3lCP4req6NAOHxL1t7M9mDlPOfiAM3tlb1LA"
+
+# Mở Google Sheets bằng tên hoặc URL
+worksheet = gc.open_by_key('1E50yrMNOO1ZZ8UM3KqO4EmV2eTQK0ph9SCM_gyxlYXA').worksheet('List MTB')
+
+# Lấy dữ liệu từ Google Sheets
+data = worksheet.get_all_records()
+main = [{'save_name': x['save_name'], 'folder_path': x['folder_path'], 'session_id': x['session_id'], 'query_id': x['query_id'], 'payload': x['payload'], 'result': x['result'], 'result_time': x['result_time'], 'run_flag': x['run_flag'], 'data_name': x['data_name']} for x in data]
+list_MTB = [query for query in main if query['run_flag'] == 'y']
+# Duyệt qua từng dòng dữ liệu và lấy session_id, url, folder_path
+def download_metabase_data(query_info):
+    try:
+        session_id = query_info['session_id']
+        query_id = query_info['query_id']
+        query_name = query_info['data_name']
+        payload = query_info['payload']
+        folder_path = query_info['folder_path']
+        save_name = query_info['save_name']
+
+        headers = {'content-type': 'application/x-www-form-urlencoded', "X-Metabase-Session": session_id}
+        
+        # Convert payload to JSON and encode it
+        payload = json.loads(payload.replace("'", "\""))
+        payload = json.dumps(payload)
+        payload = 'parameters=' + requests.utils.quote(payload, safe='')
+        
+        # Send POST request
+        url = f"https://metabase.ninjavan.co/api/card/{query_id}/query/csv"
+        response = requests.post(url, headers=headers, data=payload)
+        
+        # Check status code
+        if response.status_code == 401:
+            status = 'Failed'
+            error = 'Unauthenticated'
+        else:
+            response_content = response.content
+            if b'"error":"' in response_content:
+                error_start = response_content.find(b'"error":"') + len(b'"error":"')
+                error_end = response_content.find(b'"', error_start)
+                error_message = response_content[error_start:error_end].decode('utf-8')
+                status = 'Failed'
+                error = error_message
+            elif b'"message":"' in response_content:
+                error_start = response_content.find(b'"message":"') + len(b'"message":"')
+                error_end = response_content.find(b'"', error_start)
+                error_message = response_content[error_start:error_end].decode('utf-8')
+                status = 'Failed'
+                error = error_message
+            else:
+                df = pd.read_csv(io.BytesIO(response_content), low_memory=False)
+                df.to_csv(os.path.join(folder_path, save_name), index=False)
+                status = 'Success'
+                error = "No error"
+        print(f"{save_name}: {status}")
+        print(f"{save_name}: {error}")
+
+        # Update result and result_time
+        query_info['result'] = status
+        query_info['result_time'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+
+        # Gửi thông tin lên webhook
+        df = pd.DataFrame({
+            "query_id": [query_id],
+            "query_name": [query_name],
+            "query_result": [status]
+        })
+
+        table = tabulate(df, headers='keys', tablefmt='grid')
+        payload = {"text": table}
+        print(payload)
+
+        # Gửi webhook payload lên webhook URL
+        requests.post(webhook_url, json=payload)
+    except Exception as e:
+        print(f"{save_name}: {error}")
+
+# Sử dụng ThreadPoolExecutor để thực thi các truy vấn đồng thời 
+with concurrent.futures.ThreadPoolExecutor() as executor:
+    # Map các hàm execute_query với danh sách các query_ids
+    executor.map(download_metabase_data, list_MTB)
+
+# Cập nhật kết quả truy vấn vào Google Sheets
+for i, query_info in enumerate(list_MTB):
+    worksheet.update_cell(i + 2, 6, query_info['result'])  # Column G: result
+    worksheet.update_cell(i + 2, 7, query_info['result_time'])  # Column G: result
+
